@@ -42,11 +42,11 @@ from abc import ABC, abstractmethod
 sys.path.append("../")
 from federated.logging_settings import logger
 
-from client.causal_discovery.enco import ENCO
-from client.causal_graphs.graph_definition import CausalDAG
-from client.causal_graphs.graph_definition import CausalDAGDataset
-from client.causal_graphs.graph_generation import generate_categorical_graph, get_graph_func
-from client.causal_graphs.variable_distributions import _random_categ
+from Enco.causal_discovery.enco import ENCO
+from Enco.causal_graphs.graph_definition import CausalDAG
+from Enco.causal_graphs.graph_definition import CausalDAGDataset
+from Enco.causal_graphs.graph_generation import generate_categorical_graph, get_graph_func
+from Enco.causal_graphs.variable_distributions import _random_categ
 
 
 from cdt.metrics import SHD
@@ -263,6 +263,9 @@ class ENCOAlg(InferenceAlgorithm):
 
         local_obs_data = self.__data[start_index: end_index]
         logger.info(f'Client {self.__client_id}: Shape of the local observational data: {local_obs_data.shape}')
+        print("num_vars: ",num_vars)
+        print("self.__data.shape: " + str(self.__data.shape))
+        print("self.__data_int.shape: " + str(self.__data_int.shape))
 
         local_int_data: np.ndarray = None
         for var_idx in range(num_vars):
@@ -284,13 +287,14 @@ class ENCOAlg(InferenceAlgorithm):
         logger.info(f'Client {self.__client_id}: Excluding following variables: {excluded_variables}\n')
 
 
+        print("original_adjacency_mat:",self.original_adjacency_mat.shape)
         self._local_dag_dataset = CausalDAGDataset(self.original_adjacency_mat,
                                                    local_obs_data,
                                                    local_int_data,
                                                    exclude_inters=excluded_variables)
 
 
-    def infer_causal_structure(self, round_id, gamma_belief: np.ndarray or None,
+    def infer_causal_structure(self, round_id,gamma_threshold,theta_threshold,delta_threshold, gamma_belief: np.ndarray or None,
                                theta_belief: np.ndarray or None, num_epochs: int = 2,
                                gpu_name: str = 'cuda:0', cache: os.DirEntry = None):
         """This function calls an inference algorithm using ENCO core functions and class,
@@ -310,16 +314,13 @@ class ENCOAlg(InferenceAlgorithm):
 
         logger.info(f'Client {self.__client_id} started the inference process')
         enco_module = ENCO(graph=self._local_dag_dataset, prior_gamma=gamma_belief,
-                           prior_theta=theta_belief)
+                           prior_theta=theta_belief,gamma_threshold=gamma_threshold,theta_threshold=theta_threshold)
 
         if torch.cuda.is_available():
             enco_module.to(torch.device(gpu_name))
 
 
-        """
-        从这里开始加入因果图
-        
-        """
+
 
         enco_module.discover_graph(num_epochs=num_epochs)
         self.inferred_orientation_mat = enco_module.get_theta_matrix()
@@ -327,21 +328,58 @@ class ENCOAlg(InferenceAlgorithm):
         self.binary_adjacency_mat = ((enco_module.get_binary_adjmatrix()).detach().numpy()).astype(int)
         self.metrics_dict = enco_module.get_metrics(enforce_acyclic_graph=False)
         self.metrics_dict_acycle = enco_module.get_metrics(enforce_acyclic_graph=True)
+        # predicted_adj_matrix = enco_module.discover_graph(num_epochs=2)
+        print(self.binary_adjacency_mat)
+        # print(predicted_adj_matrix)
 
-
-        # 对称化邻接矩阵
         undirected_adj_matrix = np.maximum(self.binary_adjacency_mat, self.binary_adjacency_mat.T)
 
-        # 将非零元素设置为1
         undirected_adj_matrix[undirected_adj_matrix != 0] = 1
 
+        print(undirected_adj_matrix)
 
         data = enco_module.obs_dataset.data
+        print(data)
         G = nx.from_numpy_array(undirected_adj_matrix)
+        result_filename = f"result\\local_metrics_round{round_id}_missing{len(self.feature_missing_dict[self.__client_id])}.txt"
 
         cs = CD_CSG()
 
-        DAG, adj, csgset, adjset  = cs.predict_graph(data, G)
+        DAG, adj, csgset, adjset = cs.predict_graph(data, G, delta_threshold, self._local_dag_dataset.adj_matrix,result_filename)
+        if hasattr(self._local_dag_dataset, 'adj_matrix') and adjset is not None and csgset is not None:
+            direction_errors_total = 0
+            total_edges = 0
+            correct_directions = 0
+
+            true_adj_matrix = self._local_dag_dataset.adj_matrix
+
+            for i, (neighbors, directions) in enumerate(zip(adjset, csgset)):
+                for idx, neighbor in enumerate(neighbors):
+                    total_edges += 1
+                    if true_adj_matrix[neighbor, i] == 1:
+                        if directions[idx] < 0.5:
+                            correct_directions += 1
+                        else:
+                            direction_errors_total += 1
+                    elif true_adj_matrix[i, neighbor] == 1:
+                        if directions[idx] >= 0.5:
+                            correct_directions += 1
+                        else:
+                            direction_errors_total += 1
+
+            direction_accuracy = correct_directions / total_edges if total_edges > 0 else 0
+
+            f = open(result_filename, 'a', encoding='utf-8')
+            f.write(
+                f"\nStar Graph Direction SHD (Round {round_id}, Client {self.__client_id}): {direction_errors_total/len(csgset):.4f}")
+            f.write(
+                f"\nStar Graph Direction Accuracy (Round {round_id}, Client {self.__client_id}): {direction_accuracy:.4f}")
+            f.close()
+
+            print(f"Star Graph Direction SHD (Round {round_id}, Client {self.__client_id}): {direction_errors_total/len(csgset):.4f}")
+            print(
+                f"Star Graph Direction Accuracy (Round {round_id}, Client {self.__client_id}): {direction_accuracy:.4f}")
+
         G = nx.DiGraph()
         G.add_nodes_from([v.name for v in self._local_dag_dataset.variables])
         edges = [[self._local_dag_dataset.variables[v_idx].name for v_idx in e] for e in self._local_dag_dataset.edges.tolist()]
@@ -357,10 +395,14 @@ class ENCOAlg(InferenceAlgorithm):
         nx.draw(DAG, pos=nx.circular_layout(DAG), with_labels=True, font_size=18, width=2, node_size=1000)
         plt.savefig("result\\gound_truth_&_CD-CSG_roundid" + str(round_id) + "_clientid" + str(self.__client_id) + ".png")
 
-        f = open('result\\result.txt', 'a', encoding='utf-8')  # a 追加模式
+        f = open('result\\result.txt', 'a', encoding='utf-8')
         f.write("\n\nSHD" + str(round_id) +"_clientid"+ str(self.__client_id) + ": " + str(SHD(adj,self._local_dag_dataset.adj_matrix)))
         f.close()
 
+        print(str(round_id) +"_clientid"+ ": " +str(self.__client_id)+": ")
+        print("torch.from_numpy(adj).to(torch.int32): \n",torch.from_numpy(adj).to(torch.int32))
+        print("self._local_dag_dataset.adj_matrix: \n",torch.from_numpy(self._local_dag_dataset.adj_matrix))
+        print("~self._local_dag_dataset.adj_matrix: \n",~torch.from_numpy(self._local_dag_dataset.adj_matrix))
 
         adj_matrix_tensor = torch.from_numpy(self._local_dag_dataset.adj_matrix).to(torch.int32)
         accumulated_mat_tensor = torch.from_numpy(adj).to(torch.int32)
@@ -379,7 +421,7 @@ class ENCOAlg(InferenceAlgorithm):
         orient_FN = torch.logical_and(adj_matrix_tensor == 1, accumulated_mat_tensor == 0).float().sum().item()
         orient_acc = orient_TP / max(1e-5, orient_TP + orient_FN)
 
-        f = open('result\\result.txt', 'a', encoding='utf-8')  # a 追加模式
+        f = open('result\\result.txt', 'a', encoding='utf-8')
         f.write("\nTP" + str(round_id) +"_clientid"+str(self.__client_id)+": " + str(TP))
         f.write("\nFN" + str(round_id) +"_clientid"+str(self.__client_id)+": " + str(FN))
         f.write("\nFP" + str(round_id) +"_clientid"+str(self.__client_id)+": " + str(FP))
@@ -391,11 +433,6 @@ class ENCOAlg(InferenceAlgorithm):
         f.write("\norient_FN" + str(round_id)+"_clientid"+ str(self.__client_id) + ":" + str(orient_FN))
         f.close()
 
-        """
-        到这里结束
-
-        """
-
 
         self.inferred_orientation_mat = enco_module.get_theta_matrix()
         self.inferred_existence_mat = enco_module.get_gamma_matrix()
@@ -404,6 +441,7 @@ class ENCOAlg(InferenceAlgorithm):
         self.metrics_dict_acycle = enco_module.get_metrics(enforce_acyclic_graph=True)
         self.csgset = csgset
         self.adjset = adjset
+        print("self.csgset", self.csgset)
 
         self.save_results(cache)
         torch.cuda.empty_cache()
@@ -490,6 +528,7 @@ class ENCOAlg(InferenceAlgorithm):
         logger.debug(f'Graph is built with the provided information: \n {graph}')
 
         original_adjacency_mat = graph.adj_matrix
+        # print('original_adjacency_mat', original_adjacency_mat)
         logger.debug(f'Global dataset adjacency matrix: \n {original_adjacency_mat.astype(int)}')
 
         data_obs = graph.sample(batch_size=obs_data_size, as_array=True)
@@ -516,15 +555,11 @@ class ENCOAlg(InferenceAlgorithm):
 
         for var_idx in range(len(graph.variables)):
 
-            # Select variable to intervene on
             var = graph.variables[var_idx]
 
-            # Soft, perfect intervention => replace p(X_n) by random categorical
-            # Scale is set to 0.0, which represents a uniform distribution.
             int_dist = _random_categ(size=(var.prob_dist.num_categs,), scale=0.0, axis=-1)
 
             size = (int_data_size // len(graph.variables))
-            # Sample from interventional distribution
             value = np.random.multinomial(n=1, pvals=int_dist,
                                         size=(size,))
             value = np.argmax(value, axis=-1)
@@ -554,11 +589,8 @@ class ENCOAlg(InferenceAlgorithm):
 
         for var_idx in range(len(graph.variables)):
 
-            # Select variable to intervene on
             var = graph.variables[var_idx]
 
-            # Soft, perfect intervention => replace p(X_n) by random categorical
-            # Scale is set to 0.0, which represents a uniform distribution.
             int_dist = _random_categ(size=(var.prob_dist.num_categs,), scale=0.0, axis=-1)
 
             size = (int_data_size // len(graph.variables))

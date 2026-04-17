@@ -113,7 +113,7 @@ def GenLearning(data):
     return M
 
 
-def CSG_model(data, seed=0):
+def CSG_model(data, delta_threshold,seed=0):
     """The forward and backward model of CD-CSG.
 
     Args:
@@ -169,7 +169,7 @@ def CSG_model(data, seed=0):
         v = v.reshape(-1, 1)
         nv = nv.reshape(-1, 1)
         v_to_u = HSIC(v, nv)
-        delta = 0.05 * min(u_to_v, v_to_u)
+        delta = delta_threshold * min(u_to_v, v_to_u)
         if u_to_v < v_to_u + delta:
             result[i] = 1
         elif v_to_u < u_to_v + delta:
